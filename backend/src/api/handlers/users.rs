@@ -619,14 +619,16 @@ pub async fn update_user(
     .map_err(|e| AppError::Database(e.to_string()))?
     .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
 
-    // #3723: the setup gate is latched off at runtime once no ACTIVE admin is
-    // pending a password change, and is never re-evaluated on its own.
-    // Reactivating a local admin that is still flagged recreates exactly the
-    // row that arms it, so re-arm the latch here: the next gated request on
-    // this replica re-checks the DB and refuses until the password is
-    // rotated. Other replicas re-arm at their next restart, as with
-    // boot-time arming.
+    // #3723: the setup gate is latched off at runtime once the ACTIVE built-in
+    // admin is no longer pending a password change, and is never re-evaluated
+    // on its own. Reactivating that account while it is still flagged
+    // recreates exactly the row that arms it, so re-arm the latch here: the
+    // next gated request on this replica re-checks the DB and refuses until
+    // the password is rotated. Other replicas re-arm at their next restart,
+    // as with boot-time arming. Only the built-in `admin` arms the gate
+    // (#4634); another admin's pending change is enforced per user instead.
     if matches!(payload.is_active, Some(true))
+        && user.username == crate::api::BUILTIN_ADMIN_USERNAME
         && user.is_admin
         && user.must_change_password
         && user.external_id.is_none()
@@ -1452,9 +1454,16 @@ async fn change_password_inner(
     )
     .await;
 
-    // If this user had must_change_password, check if setup mode should be unlocked
-    if had_must_change && state.setup_required.load(Ordering::Relaxed) {
-        state.setup_required.store(false, Ordering::Relaxed);
+    // If this user had must_change_password, check if setup mode should be
+    // unlocked. Only the built-in admin's rotation completes setup (#4634), so
+    // ask the DB rather than assuming: another admin rotating its temporary
+    // password must not drop the gate while `admin` is still pending.
+    // `setup_still_required` latches the flag off once nothing is pending and
+    // keeps the lock if the DB cannot be reached.
+    if had_must_change
+        && state.setup_required.load(Ordering::Relaxed)
+        && !state.setup_still_required().await
+    {
         tracing::info!("Setup complete. API fully unlocked.");
 
         // Delete the password file (best-effort).

@@ -2125,16 +2125,47 @@ async fn provision_admin_user(
     // `external_id IS NOT NULL` routes that case to the create branch, whose
     // upsert is itself guarded against clobbering a federated row.
     //
+    // The row examined here is the built-in `admin` account and only that one
+    // (#4634). Everything that follows -- arming the setup gate, regenerating
+    // `admin.password`, rewriting the password hash -- is about that account
+    // (every write below is keyed on `username = 'admin'`, and the password
+    // file and the setup instructions name it). The lookup used to be
+    // `LIMIT 1` over EVERY local admin with no `ORDER BY`, so an unrelated
+    // admin created in the UI with a temporary password and not yet logged in
+    // could be the row returned: the gate armed on its flag and the real
+    // `admin`, with nothing pending, had its password replaced. Other admins
+    // with a pending change are still forced to rotate at their own login.
+    //
     // `is_active` is read alongside, NOT filtered on (#3723): filtering would
     // route a deactivated built-in admin to the create branch, whose upsert
     // overwrites its hash and re-arms the gate on every boot.
     let admin_row: Option<(bool, bool)> = sqlx::query_as(
         "SELECT must_change_password, is_active FROM users \
-         WHERE is_admin = true AND external_id IS NULL LIMIT 1",
+         WHERE username = 'admin' AND is_admin = true AND external_id IS NULL",
     )
     .fetch_optional(&mut *tx)
     .await
     .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
+
+    // No built-in `admin`, but another local admin exists (the operator renamed
+    // or removed it): an admin account is already provisioned, so there is
+    // nothing to create, no password to regenerate and no gate to arm. This is
+    // the "an admin exists" half of the old lookup, kept as a plain existence
+    // check that cannot depend on row order.
+    if admin_row.is_none() {
+        let other_local_admin: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM users WHERE is_admin = true AND external_id IS NULL)",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
+        if other_local_admin {
+            tx.commit()
+                .await
+                .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
+            return Ok(false);
+        }
+    }
 
     let demo_mode = matches!(std::env::var("DEMO_MODE").as_deref(), Ok("true" | "1"));
 
@@ -2886,10 +2917,9 @@ mod tests {
     /// creating tests outside it. Un-ignore with the fix in #3796.
     #[tokio::test]
     async fn provision_admin_user_does_not_arm_gate_for_inactive_admin_3723() {
-        // Runs on its own freshly-migrated database (#3796): the function's
-        // existing-admin lookup is `LIMIT 1` over every local admin, so the
-        // shared unit-test database, where hundreds of tests create admins,
-        // could never guarantee the precondition this test needs.
+        // Runs on its own freshly-migrated database (#3796): the shared
+        // unit-test database, where hundreds of tests create admins, could
+        // never guarantee the precondition this test needs.
         let Some(iso) = artifact_keeper_backend::testing::try_isolated_pool().await else {
             return;
         };
@@ -2903,9 +2933,8 @@ mod tests {
             .execute(&pool)
             .await
             .expect("clear leftover");
-        // The lookup under test is `LIMIT 1` over every local admin, so any
-        // other local admin row (a leftover from an aborted run of another
-        // DB-backed test) would make its result arbitrary. Say so up front
+        // Any other local admin row (a leftover from an aborted run of another
+        // DB-backed test) would change which branch runs. Say so up front
         // rather than failing a later assertion for an unrelated reason.
         sqlx::query(
             "INSERT INTO users (username, email, password_hash, auth_provider, is_admin,                                 must_change_password, is_active)              VALUES ('admin', $1, 'seed-hash-3723', 'local', true, true, false)",
@@ -2979,6 +3008,85 @@ mod tests {
         );
         assert!(file_written, "the missing password file is regenerated");
         assert_ne!(hash_after, "seed-hash-3723");
+    }
+
+    /// #4634: an unrelated admin that still holds a temporary password must
+    /// not arm the setup gate or cause the built-in `admin`'s password to be
+    /// regenerated. The pending admin is inserted FIRST, so a sequential scan
+    /// (what the old `LIMIT 1` lookup did on a table this small) returns it
+    /// before `admin`.
+    #[tokio::test]
+    async fn provision_admin_user_ignores_other_admins_pending_change_4634() {
+        let Some(iso) = artifact_keeper_backend::testing::try_isolated_pool().await else {
+            return;
+        };
+        let pool = iso.pool.clone();
+        for (username, hash, must_change) in [
+            ("pending-4634", "seed-hash-pending", true),
+            ("admin", "seed-hash-admin", false),
+        ] {
+            sqlx::query(
+                "INSERT INTO users (username, email, password_hash, auth_provider, is_admin, \
+                                    must_change_password) \
+                 VALUES ($1, $2, $3, 'local', true, $4)",
+            )
+            .bind(username)
+            .bind(format!("{username}@test.local"))
+            .bind(hash)
+            .bind(must_change)
+            .execute(&pool)
+            .await
+            .expect("seed admin");
+        }
+        async fn hash_of(pool: &sqlx::PgPool, username: &str) -> Option<String> {
+            sqlx::query_scalar::<_, String>("SELECT password_hash FROM users WHERE username = $1")
+                .bind(username)
+                .fetch_optional(pool)
+                .await
+                .expect("read hash")
+        }
+
+        let dir = std::env::temp_dir().join(format!("ak-provision-4634-{}", uuid::Uuid::new_v4()));
+        let password_file = dir.join("admin.password");
+        let policy = PasswordPolicyConfig::default();
+
+        let armed = provision_admin_user(&pool, dir.to_str().unwrap(), &policy)
+            .await
+            .expect("provision_admin_user");
+        let admin_hash = hash_of(&pool, "admin").await;
+        let pending_hash = hash_of(&pool, "pending-4634").await;
+        let file_written = password_file.exists();
+
+        // No built-in `admin` at all (renamed or removed), another admin still
+        // pending: nothing is created, regenerated or armed either.
+        sqlx::query("DELETE FROM users WHERE username = 'admin'")
+            .execute(&pool)
+            .await
+            .expect("remove built-in admin");
+        let armed_without_builtin = provision_admin_user(&pool, dir.to_str().unwrap(), &policy)
+            .await
+            .expect("provision_admin_user (no built-in admin)");
+        let recreated = hash_of(&pool, "admin").await;
+        let file_written_without_builtin = password_file.exists();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            !armed,
+            "another admin's pending change must not arm the gate"
+        );
+        assert_eq!(
+            admin_hash.as_deref(),
+            Some("seed-hash-admin"),
+            "the built-in admin's password must not be regenerated"
+        );
+        assert_eq!(pending_hash.as_deref(), Some("seed-hash-pending"));
+        assert!(!file_written, "no admin.password may be written");
+        assert!(
+            !armed_without_builtin,
+            "a missing built-in admin with another admin present arms nothing"
+        );
+        assert_eq!(recreated, None, "an existing admin means no new admin");
+        assert!(!file_written_without_builtin);
     }
 
     // -----------------------------------------------------------------

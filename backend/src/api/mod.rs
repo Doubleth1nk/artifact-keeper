@@ -175,6 +175,13 @@ pub type SignedReleaseCacheIndex = Arc<RwLock<HashMap<(String, String), Vec<Stri
 /// still bounding worst-case memory if the cache ever grows pathologically.
 pub const SIGNED_RELEASE_CACHE_MAX_ENTRIES: usize = 1024;
 
+/// Username of the built-in bootstrap admin account (#4634).
+///
+/// The first-run setup gate, `admin.password` and the SQL that provisions and
+/// re-checks them all refer to this one account, so a pending password change
+/// on any other admin must not arm, hold or re-arm the gate.
+pub const BUILTIN_ADMIN_USERNAME: &str = "admin";
+
 /// Application state shared across handlers
 #[derive(Clone)]
 pub struct AppState {
@@ -403,6 +410,12 @@ impl AppState {
     /// back to `true` at runtime, so after the first confirmation no further
     /// queries are issued.
     ///
+    /// Only the built-in `admin` account counts (#4634), the same account
+    /// `provision_admin_user` arms the gate for at boot. Any other admin with a
+    /// pending change would keep every replica locked after `admin` had
+    /// already rotated its password, and it is still forced to rotate at its
+    /// own login by the per-user 428 in the auth middleware.
+    ///
     /// Only an **active** admin counts (#3723): local login filters on
     /// `is_active`, so a deactivated built-in admin can never complete the
     /// change-password flow, and gating on it would lock the instance with
@@ -419,7 +432,8 @@ impl AppState {
         }
         match sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS(SELECT 1 FROM users \
-             WHERE is_admin = true AND must_change_password = true AND is_active = true)",
+             WHERE username = 'admin' AND is_admin = true AND external_id IS NULL \
+               AND must_change_password = true AND is_active = true)",
         )
         .fetch_one(&self.db)
         .await
