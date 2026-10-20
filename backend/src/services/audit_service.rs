@@ -41,6 +41,8 @@ pub enum AuditAction {
     ArtifactMetadataUpdated,
     /// A soft-deleted artifact was restored from the trash (#2072).
     ArtifactRestored,
+    /// A trashed artifact was permanently deleted before storage GC reached it.
+    ArtifactPurged,
 
     // System operations
     BackupStarted,
@@ -256,6 +258,7 @@ impl AuditAction {
             AuditAction::ArtifactDeleted => "ARTIFACT_DELETED",
             AuditAction::ArtifactMetadataUpdated => "ARTIFACT_METADATA_UPDATED",
             AuditAction::ArtifactRestored => "ARTIFACT_RESTORED",
+            AuditAction::ArtifactPurged => "ARTIFACT_PURGED",
             AuditAction::BackupStarted => "BACKUP_STARTED",
             AuditAction::BackupCompleted => "BACKUP_COMPLETED",
             AuditAction::BackupFailed => "BACKUP_FAILED",
@@ -1431,6 +1434,7 @@ mod tests {
             "ARTIFACT_METADATA_UPDATED"
         );
         assert_eq!(AuditAction::ArtifactRestored.as_str(), "ARTIFACT_RESTORED");
+        assert_eq!(AuditAction::ArtifactPurged.as_str(), "ARTIFACT_PURGED");
     }
 
     #[test]
